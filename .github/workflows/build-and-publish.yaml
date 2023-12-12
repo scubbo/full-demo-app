@@ -1,0 +1,88 @@
+name: Build, Push, and Update
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  docker-build-and-push:
+    name: Build and Push
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v2.4.1
+        with:
+          url: https://l9jx2j8g-8200.usw3.devtunnels.ms
+          path: jwt
+          role: scubbo-full-demo
+          method: jwt
+          secrets: |
+            static-kv/data/github-pat/scubbo-full-demo token | GITHUB_PAT;
+
+      # IDK why but the `docker/login-action@v3` doesn't work - have to use this alternative approach to login instead
+      - name: Login to GHCR
+        run:
+          echo "$GITHUB_PAT" | docker login ghcr.io -u scubbo --password-stdin
+          # TODO - user should be separately parametrizable when productionized! The GitHub login user will not necessarily be the same as the "owner" (typically, organization) of a repo
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Build and push
+        run: |
+          docker build -t ghcr.io/scubbo/full-demo-app:$GITHUB_SHA .
+          docker push ghcr.io/scubbo/full-demo-app:$GITHUB_SHA
+          docker tag ghcr.io/scubbo/full-demo-app:$GITHUB_SHA ghcr.io/scubbo/full-demo-app:latest
+          docker push ghcr.io/scubbo/full-demo-app:latest
+
+  # TODO - this doesn't actually call sync on the Argo App, because I haven't figured out how to get ArgoCD Auth Tokens
+  # from Vault itself. That would be a great way to demonstrate the ability for Compositions to cascade their changes,
+  # though!
+  update-app:
+    name: Update app
+    runs-on: ubuntu-latest
+    needs:
+      - docker-build-and-push
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    steps:
+      - name: setup kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+
+      - name: Import Secrets
+        uses: hashicorp/vault-action@v2.4.1
+        with:
+          url: https://l9jx2j8g-8200.usw3.devtunnels.ms
+          path: jwt
+          role: scubbo-full-demo
+          method: jwt
+          secrets: |
+            static-kv/data/github-pat/scubbo-full-demo token | GITHUB_PAT;
+
+      - name: Check out deployment repo
+        uses: actions/checkout@v3
+        with:
+          path: deployment
+          repository: scubbo/full-demo-deployment
+          token: ${{ env.GITHUB_PAT}}
+
+      - name: Update deployment repo image tag
+        run: |
+          cd deployment && ../kustomize edit set image "app_code_image=*:$GITHUB_SHA"
+          git config --global user.email "automation@legalzoom.com"
+          git config --global user.name "GH Actions"
+          git add . && git commit -m "Set image to $GITHUB_SHA" && git push origin
+          cd ..
+          rm -rf deployment
